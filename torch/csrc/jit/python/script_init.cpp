@@ -214,7 +214,6 @@ FunctionDefaults calcOverloadedFunctionDefaults(
   }
   return updated_defaults;
 }
-
 } // namespace
 
 bool checkMutableFunctionDefault(const py::object& def_arg) {
@@ -285,8 +284,7 @@ FunctionSchema getSchemaWithNameAndDefaults(
 
 static Decl mergeDefaultsAndExtraParametersToOverloadDecl(
     const Decl& overload_decl,
-    const Decl& impl_decl,
-    const FunctionDefaults& defaults) {
+    const Decl& impl_decl) {
   std::vector<Param> adjusted_params;
   const auto& overload_params = overload_decl.params();
   const auto& impl_params = impl_decl.params();
@@ -312,15 +310,48 @@ static Decl mergeDefaultsAndExtraParametersToOverloadDecl(
           << "Found " << overload_name << " and " << impl_name
           << " on argument " << i;
     }
-    adjusted_params.push_back(overload_params[i]);
+
+    auto overload_type = overload_params[i].type();
+    auto overload_default = overload_params[i].defaultValue();
+    auto impl_type = impl_params[i].type();
+    auto impl_default = impl_params[i].defaultValue();
+
+    // If the overload has no default value but the impl does, copy it
+    // over if the types match.
+    bool add_default = false;
+    if (!overload_default.present() && impl_default.present()) {
+      if (impl_type.present() && overload_type.present() &&
+          impl_type.get().kind() == TK_VAR &&
+          overload_type.get().kind() == TK_VAR) {
+        auto impl_ty = Var(impl_type.get());
+        auto overload_ty = Var(overload_type.get());
+
+        if (impl_ty.name().name() == overload_ty.name().name()) {
+          add_default = true;
+        }
+      } else if (overload_type.present() && impl_default.present()) {
+        auto overload_ty = Var(overload_type.get());
+        bool float_and_const = impl_default.get().kind() == TK_CONST &&
+            Const(impl_default.get()).isFloatingPoint() &&
+            overload_ty.name().name() == FloatType::get()->annotation_str();
+        bool int_and_const = impl_default.get().kind() == TK_CONST &&
+            Const(impl_default.get()).isIntegral() &&
+            overload_ty.name().name() == IntType::get()->annotation_str();
+        bool str_and_literal = impl_default.get().kind() == TK_STRINGLITERAL &&
+            overload_ty.name().name() == StringType::get()->annotation_str();
+        if (float_and_const || int_and_const || str_and_literal) {
+          add_default = true;
+        }
+      }
+    }
+
+    if (!add_default) {
+      adjusted_params.push_back(overload_params[i]);
+    } else {
+      adjusted_params.push_back(overload_params[i].withDefault(impl_default));
+    }
   }
   for (size_t i = overload_params.size(); i < impl_params.size(); ++i) {
-    if (!defaults.count(impl_params[i].ident().name())) {
-      throw ErrorReport(impl_decl.range())
-          << "Expected to find default parameter on argument"
-          << impl_params[i].ident().name()
-          << " because it is not defined on the overloaded declaration";
-    }
     if (!impl_params[i].type().present()) {
       throw ErrorReport(impl_decl.range())
           << "Parameters not specified on the overloaded declaration must have a type annotation in the implementation function."
@@ -339,7 +370,6 @@ static StrongFunctionPtr script_compile_overloaded_function(
     const Decl& overload_decl,
     const Def& implementation_def,
     ResolutionCallback rcb,
-    const FunctionDefaults& implementation_defaults,
     const py::object& signature) {
   if (signature.is(py::none())) {
     throw ErrorReport(overload_decl.range())
@@ -347,7 +377,7 @@ static StrongFunctionPtr script_compile_overloaded_function(
   }
 
   auto adjusted_decl = mergeDefaultsAndExtraParametersToOverloadDecl(
-      overload_decl, implementation_def.decl(), implementation_defaults);
+      overload_decl, implementation_def.decl());
   auto new_def = implementation_def.withDecl(adjusted_decl);
   auto cu = get_python_cu();
   auto defined_functions = cu->define(
@@ -360,13 +390,6 @@ static StrongFunctionPtr script_compile_overloaded_function(
       true);
   TORCH_INTERNAL_ASSERT(defined_functions.size() == 1);
   auto& defined = defined_functions[0];
-  FunctionDefaults updated_defaults = calcOverloadedFunctionDefaults(
-      defined->getSchema(), implementation_defaults);
-  defined->setSchema(getSchemaWithNameAndDefaults(
-      new_def.range(),
-      defined->getSchema(),
-      new_def.name().name(),
-      updated_defaults));
   StrongFunctionPtr ret(std::move(cu), defined);
   didFinishEmitFunction(ret);
   return ret;
@@ -375,7 +398,6 @@ static StrongFunctionPtr script_compile_overloaded_function(
 static StrongFunctionPtr script_compile_function(
     const c10::QualifiedName& name,
     const Def& def,
-    const FunctionDefaults& defaults,
     ResolutionCallback rcb) {
   auto cu = get_python_cu();
   auto defined_functions = cu->define(
@@ -388,8 +410,6 @@ static StrongFunctionPtr script_compile_function(
       true);
   TORCH_INTERNAL_ASSERT(defined_functions.size() == 1);
   auto& defined = defined_functions[0];
-  defined->setSchema(getSchemaWithNameAndDefaults(
-      def.range(), defined->getSchema(), def.name().name(), defaults));
   StrongFunctionPtr ret(std::move(cu), defined);
   didFinishEmitFunction(ret);
   return ret;
@@ -1242,14 +1262,11 @@ void initJitScriptBindings(PyObject* module) {
       });
   m.def(
       "_jit_script_compile",
-      [](const std::string& qualname,
-         const Def& def,
-         ResolutionCallback rcb,
-         const FunctionDefaults& defaults) {
+      [](const std::string& qualname, const Def& def, ResolutionCallback rcb) {
         C10_LOG_API_USAGE_ONCE("torch.script.compile");
         const auto name = c10::QualifiedName(qualname);
         TORCH_INTERNAL_ASSERT(name.name() == def.name().name());
-        return script_compile_function(name, def, defaults, std::move(rcb));
+        return script_compile_function(name, def, std::move(rcb));
       });
   m.def(
       "_jit_script_compile_overload",
@@ -1261,12 +1278,7 @@ void initJitScriptBindings(PyObject* module) {
          const py::object& signature) {
         const auto name = c10::QualifiedName(qualname);
         return script_compile_overloaded_function(
-            name,
-            overload_decl,
-            implementation_def,
-            std::move(rcb),
-            implementation_defaults,
-            signature);
+            name, overload_decl, implementation_def, std::move(rcb), signature);
       });
   m.def(
       "_replace_overloaded_method_decl",
@@ -1595,8 +1607,7 @@ void initJitScriptBindings(PyObject* module) {
              const std::vector<Property>& properties,
              const std::vector<ResolutionCallback>& propertyRcbs,
              const std::vector<Def>& methodDefs,
-             const std::vector<ResolutionCallback>& methodRcbs,
-             const std::vector<FunctionDefaults>& defaults) {
+             const std::vector<ResolutionCallback>& methodRcbs) {
             TORCH_INTERNAL_ASSERT(methodDefs.size() == methodRcbs.size());
             TORCH_INTERNAL_ASSERT(properties.size() == propertyRcbs.size());
 
@@ -1623,21 +1634,6 @@ void initJitScriptBindings(PyObject* module) {
                 methodDefs,
                 methodResolvers,
                 &self);
-            // Stitch in default arguments for each Def if provided
-            auto defaults_it = defaults.begin();
-            auto defs_it = methodDefs.begin();
-            while (defs_it != methodDefs.end()) {
-              const auto method_name =
-                  QualifiedName(prefix, (*defs_it).name().name());
-              auto& method = cu->get_function(method_name);
-              method.setSchema(getSchemaWithNameAndDefaults(
-                  defs_it->range(),
-                  method.getSchema(),
-                  at::nullopt,
-                  *defaults_it));
-              ++defs_it;
-              ++defaults_it;
-            }
           });
 
   m.def(
